@@ -1,0 +1,134 @@
+name: Deployment
+
+on:
+  workflow_call:
+    secrets:
+      gh_cr_token:
+        description: 'GitHub Container Registry token'
+        required: true
+      kubeconfig:
+        description: 'Kubeconfig'
+        required: true
+    inputs:
+      namespace:
+        type: string
+        description: 'Kubernetes namespace'
+        required: true
+      version:
+        type: string
+        description: 'Image version tag'
+        required: true
+        default: 'latest'
+      app:
+        type: string
+        description: 'Application name'
+        required: true
+      path:
+        type: string
+        description: 'Path to the deployment YAML file'
+        required: true
+      registry:
+        type: string
+        description: 'Container registry'
+        required: true
+      sleep_time:
+        type: string
+        description: 'Sleep time in seconds'
+        required: true
+        default: '10'
+      log_tail:
+        type: string
+        description: 'Log tail'
+        required: true
+        default: '50'
+      timeout:
+        type: string
+        description: 'Timeout in seconds'
+        required: true
+        default: '300'
+jobs:
+  deploy:
+    name: "${{ inputs.app }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_CR_TOKEN }}
+          fetch-depth: 0
+      - name: "Setup kubectl"
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: "Configure kubectl"
+        run: |
+          mkdir -p $HOME/.kube
+          # Check if KUBECONFIG is already base64 encoded or raw content
+          if echo "${{ secrets.kubeconfig }}" | base64 -d &>/dev/null; then
+            echo "${{ secrets.kubeconfig }}" | base64 -d > $HOME/.kube/config
+          else
+            echo "${{ secrets.kubeconfig }}" > $HOME/.kube/config
+          fi
+          chmod 600 $HOME/.kube/config
+
+      - name: Apply ${{ inputs.app }} deployment
+        run: |
+          kubectl apply -f ${{ inputs.path }}
+
+      - name: Monitor ${{ inputs.app }} deployment with real-time logs
+        run: |
+          echo "Starting parallel monitoring of deployment rollout and pod logs..."
+
+          # Function to monitor rollout status
+          monitor_rollout() {
+            echo "[ROLLOUT] Waiting for deployment rollout..."
+            kubectl rollout status deployment/${{ inputs.app }} -n ${{ inputs.namespace }} --timeout=${{ inputs.timeout }}s
+            echo $? > /tmp/rollout_exit_code
+            echo "[ROLLOUT] Deployment rollout completed with exit code: $(cat /tmp/rollout_exit_code)"
+          }
+
+          # Function to follow logs
+          follow_logs() {
+            echo "[LOGS] Waiting for pods to be ready..."
+            sleep ${{ inputs.sleep_time }}
+
+            while true; do
+              # Get the newest pod
+              NEW_POD=$(kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.app }} --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null || echo "")
+
+              if [ ! -z "$NEW_POD" ]; then
+                echo "[LOGS] Following logs for pod: $NEW_POD"
+                kubectl logs -f $NEW_POD -n ${{ inputs.namespace }} --tail=${{ inputs.log_tail }} 2>/dev/null || {
+                  echo "[LOGS] Pod not ready yet, retrying in 5 seconds..."
+                  kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.app }}
+                  sleep 5
+                  continue
+                }
+                break
+              else
+                echo "[LOGS] No pods found yet, waiting..."
+                sleep 5
+              fi
+            done
+          }
+
+          # Start both functions in parallel
+          monitor_rollout &
+          ROLLOUT_PID=$!
+
+          follow_logs &
+          LOGS_PID=$!
+
+          # Wait for rollout to complete
+          wait $ROLLOUT_PID
+
+          # Stop log following
+          kill $LOGS_PID 2>/dev/null || true
+
+          # Get and return rollout exit code
+          ROLLOUT_EXIT_CODE=$(cat /tmp/rollout_exit_code 2>/dev/null || echo "1")
+          echo "Final deployment status: $ROLLOUT_EXIT_CODE"
+          exit $ROLLOUT_EXIT_CODE
